@@ -60,20 +60,20 @@ If the gateway returns an error like `Invalid size ... below the current minimum
 
 For text-to-image:
 
-```powershell
-python scripts/generate_gateway_image.py --prompt "<prompt>" --out "<output-path>" --size 1024x1024
+```bash
+python3 scripts/generate_gateway_image.py --prompt "<prompt>" --out "<output-path>" --size 1024x1024
 ```
 
 For image editing with a local reference image:
 
-```powershell
-python scripts/generate_gateway_image.py --prompt "<prompt>" --image "<reference-image>" --action edit --out "<output-path>" --size 1024x1536
+```bash
+python3 scripts/generate_gateway_image.py --prompt "<prompt>" --image "<reference-image>" --action edit --out "<output-path>" --size 1024x1536
 ```
 
 For image editing with multiple references:
 
-```powershell
-python scripts/generate_gateway_image.py --prompt "<prompt>" --image "<reference-1>" --image "<reference-2>" --action edit --out "<output-path>" --size 1024x1536
+```bash
+python3 scripts/generate_gateway_image.py --prompt "<prompt>" --image "<reference-1>" --image "<reference-2>" --action edit --out "<output-path>" --size 1024x1536
 ```
 
 Optional inputs:
