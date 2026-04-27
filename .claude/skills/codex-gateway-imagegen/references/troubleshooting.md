@@ -29,6 +29,19 @@ Action:
 1. Print the error body.
 2. Fix the request, not the transport.
 
+### Image rate limit
+
+Symptoms:
+
+- Stream or HTTP error contains `rate_limit_exceeded`
+- Error mentions `input-images per min`, `image_generation`, `Limit`, `Used`, or `Please try again in ...`
+
+Action:
+
+1. Keep the original prompt, images, size, model, and action.
+2. Do not shorten, rewrite, simplify, or otherwise change the prompt.
+3. Retry the same request after the reported delay or exponential backoff interval.
+
 Common example:
 
 - `Invalid size ... below the current minimum pixel budget`

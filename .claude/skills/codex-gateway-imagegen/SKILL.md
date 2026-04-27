@@ -20,8 +20,9 @@ It supports both:
    - Portrait / phone screenshot: `1024x1536`
    - Landscape: `1536x1024`
 3. Run `scripts/generate_gateway_image.py`.
-4. If the request fails inside the sandbox with TLS, schannel, or read-timeout errors, rerun the same command with escalated host-network access.
-5. Report the saved file path.
+4. If image generation is rate-limited, keep the original prompt, images, size, and action. Do not shorten, rewrite, simplify, or otherwise change the prompt. The helper script retries the same request with backoff.
+5. If the request fails inside the sandbox with TLS, schannel, or read-timeout errors, rerun the same command with escalated host-network access.
+6. Report the saved file path.
 
 ## Workflow
 
@@ -82,6 +83,7 @@ Optional inputs:
 - `--image-url <url>`: remote reference image, repeatable
 - `--mask <path>`: local mask image for targeted edit regions
 - `--action auto|generate|edit`: defaults to `auto`
+- `--max-retries <number>`: maximum retries for image rate-limit errors, defaults to `5`
 
 The script:
 
@@ -112,6 +114,8 @@ If the call fails inside the sandbox with networking or TLS symptoms such as:
 then treat that as an environment-path problem first, not necessarily a gateway problem. Rerun the same script outside the sandbox with escalated host-network access.
 
 If the call reaches the gateway and returns an HTTP error body, inspect the body before changing the prompt.
+
+If the gateway or stream returns `rate_limit_exceeded` for image generation, do not change the prompt. Retry the original request after the reported delay or backoff interval. Prompt simplification is not a fix for image-per-minute limits.
 
 If the result ignores the reference image too loosely:
 

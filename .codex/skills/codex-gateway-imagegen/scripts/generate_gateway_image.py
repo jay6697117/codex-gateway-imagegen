@@ -9,11 +9,13 @@ import argparse
 import base64
 import json
 import mimetypes
+import re
+import ssl
 import sys
+import time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
-import ssl
 
 try:
     import tomllib
@@ -24,11 +26,23 @@ except ModuleNotFoundError:  # pragma: no cover
 DEFAULT_MODEL = "gpt-5.5"
 DEFAULT_TIMEOUT = 600
 DEFAULT_SIZE = "1024x1024"
+DEFAULT_MAX_RETRIES = 5
 DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 DEFAULT_INSTRUCTIONS = (
     "You are an image generation assistant. Use the image_generation tool to create the requested image "
-    "and return the generated result."
+    "and return the generated result. If image generation is rate-limited, do not rewrite, shorten, "
+    "or simplify the user's prompt. Retry the same request after the rate-limit delay."
 )
+
+
+class StreamRateLimitError(RuntimeError):
+    def __init__(self, message: str, retry_after_seconds: float | None = None):
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+
+
+class StreamError(RuntimeError):
+    pass
 
 
 def load_config() -> tuple[str, str]:
@@ -90,6 +104,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Responses model to call.")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="HTTP timeout in seconds.")
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=DEFAULT_MAX_RETRIES,
+        help="Maximum retries for image rate-limit errors. Retries keep the original prompt and inputs.",
+    )
     return parser.parse_args()
 
 
@@ -167,6 +187,47 @@ def extract_image_base64(data: dict) -> str:
     raise RuntimeError("No image_generation_call result returned")
 
 
+def parse_retry_after_seconds(message: str) -> float | None:
+    match = re.search(r"try again in\s+(\d+(?:\.\d+)?)\s*(ms|s)", message, re.IGNORECASE)
+    if not match:
+        return None
+
+    value = float(match.group(1))
+    unit = match.group(2).lower()
+    if unit == "ms":
+        return value / 1000
+    return value
+
+
+def get_stream_error(event: dict) -> dict | None:
+    error = event.get("error")
+    if isinstance(error, dict):
+        return error
+    if event.get("type") == "error":
+        return {"message": json.dumps(event, ensure_ascii=False)}
+    return None
+
+
+def is_image_rate_limit_error(error: dict) -> bool:
+    return error.get("code") == "rate_limit_exceeded" and error.get("type") in {
+        "input-images",
+        "image_generation",
+        "rate_limit_error",
+    }
+
+
+def parse_http_error_body(message: str) -> dict | None:
+    try:
+        data = json.loads(message)
+    except json.JSONDecodeError:
+        return None
+
+    error = data.get("error")
+    if isinstance(error, dict):
+        return error
+    return None
+
+
 def collect_sse_output_items(response) -> list[dict]:
     output_items: list[dict] = []
 
@@ -180,6 +241,13 @@ def collect_sse_output_items(response) -> list[dict]:
             break
 
         event = json.loads(payload)
+        error = get_stream_error(event)
+        if error:
+            message = str(error.get("message") or json.dumps(error, ensure_ascii=False))
+            if is_image_rate_limit_error(error):
+                raise StreamRateLimitError(message, parse_retry_after_seconds(message))
+            raise StreamError(message)
+
         if event.get("type") == "response.output_item.done" and isinstance(event.get("item"), dict):
             output_items.append(event["item"])
 
@@ -193,25 +261,66 @@ def extract_image_base64_from_items(items: list[dict]) -> str:
     raise RuntimeError("No image_generation_call result returned")
 
 
+def request_image(base_url: str, api_key: str, body: bytes, timeout: int) -> list[dict]:
+    request = Request(
+        f"{base_url}/responses",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        },
+        method="POST",
+    )
+
+    try:
+        with urlopen(request, context=ssl.create_default_context(), timeout=timeout) as response:
+            return collect_sse_output_items(response)
+    except HTTPError as exc:
+        message = exc.read().decode("utf-8", errors="replace")
+        error = parse_http_error_body(message)
+        if error and is_image_rate_limit_error(error):
+            retry_message = str(error.get("message") or message)
+            raise StreamRateLimitError(retry_message, parse_retry_after_seconds(retry_message)) from exc
+        raise
+
+
+def retry_delay_seconds(exc: StreamRateLimitError, attempt: int) -> float:
+    if exc.retry_after_seconds is not None:
+        return max(exc.retry_after_seconds, 0.25)
+    return min(2 ** (attempt - 1), 8)
+
+
 def main() -> int:
     args = parse_args()
 
     try:
         base_url, api_key = load_config()
         body = build_payload(args)
-        request = Request(
-            f"{base_url}/responses",
-            data=body,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-                "Accept": "text/event-stream",
-            },
-            method="POST",
-        )
+        output_items = []
 
-        with urlopen(request, context=ssl.create_default_context(), timeout=args.timeout) as response:
-            output_items = collect_sse_output_items(response)
+        for attempt in range(1, args.max_retries + 2):
+            try:
+                output_items = request_image(base_url, api_key, body, args.timeout)
+                break
+            except StreamRateLimitError as exc:
+                if attempt > args.max_retries:
+                    raise
+                delay = retry_delay_seconds(exc, attempt)
+                print(
+                    json.dumps(
+                        {
+                            "warning": "rate_limited_retrying_original_request",
+                            "attempt": attempt,
+                            "max_retries": args.max_retries,
+                            "delay_seconds": delay,
+                            "message": str(exc),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    file=sys.stderr,
+                )
+                time.sleep(delay)
 
         image_base64 = extract_image_base64_from_items(output_items)
         output_path = Path(args.out).resolve()
@@ -232,6 +341,22 @@ def main() -> int:
             ),
             file=sys.stderr,
         )
+        return 1
+    except StreamRateLimitError as exc:
+        print(
+            json.dumps(
+                {
+                    "error": "rate_limit_exceeded",
+                    "message": str(exc),
+                    "note": "Retried with the original prompt and inputs; no prompt simplification was applied.",
+                },
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+        return 1
+    except StreamError as exc:
+        print(json.dumps({"error": "stream_error", "message": str(exc)}, ensure_ascii=False), file=sys.stderr)
         return 1
     except URLError as exc:
         print(json.dumps({"error": "network_error", "message": str(exc)}, ensure_ascii=False), file=sys.stderr)
